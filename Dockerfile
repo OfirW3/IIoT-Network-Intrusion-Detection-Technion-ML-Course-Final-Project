@@ -17,9 +17,9 @@ WORKDIR /app
 RUN mkdir -p data/staging data/processing data/csvs data/archive
 
 # Copy the needed files from the host into the container
-COPY rf_model.pkl /app/
-COPY nids_runner.py /app/
-COPY CICFlowMeter/ /app/CICFlowMeter/
+COPY models/rf_model.pkl /app/
+COPY src/nids_runner.py /app/
+COPY external_tools/CICFlowMeter/ /app/CICFlowMeter/
 
 RUN chmod +x /app/CICFlowMeter/bin/cfm
 
