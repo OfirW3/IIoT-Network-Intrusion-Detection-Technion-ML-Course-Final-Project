@@ -64,7 +64,14 @@ def ensure_dirs():
 
 def load_processed():
     if PROCESSED_DB.exists():
-        return set(json.loads(PROCESSED_DB.read_text()))
+        text = PROCESSED_DB.read_text().strip()
+        if not text:  # If the file exists but is completely empty
+            return set()
+        try:
+            return set(json.loads(text))
+        except Exception as e:
+            print(f"Warning: Could not read processed DB ({e}). Starting fresh.")
+            return set()
     return set()
 
 
@@ -113,52 +120,60 @@ def count_tcp_flag_bits(flag_ints):
 
 
 def process_pcap(path):
-
-    flows = defaultdict(lambda:{
-        "times":[],
-        "pkt_len":[],
-        "payload":[],
-        "ttl":[],
-        "ip_len":[],
-        "flags":[],
-        "window":[],
-        "mss":[],
-        "hdr_len":[],
-        "fragmented_count":0,
-        "ports":set(),
-        "ips":set(),
-        "macs":set(),
-        "protocols":set(),
-        "tcp_flags":[]
+    flows = defaultdict(lambda: {
+        "times": [],
+        "time_deltas": [],
+        "pkt_len": [],
+        "payload": [],
+        "ttl": [],
+        "ip_len": [],
+        "flags": [],
+        "window": [],
+        "mss": [],
+        "hdr_len": [],
+        "tcp_flags": [],
+        
+        "fragmented_count": 0,
+        "pkts_src": 0,
+        "pkts_dst": 0,
+        
+        "ips_all": set(),
+        "ips_src": set(),
+        "ips_dst": set(),
+        
+        "ports_all": set(),
+        "ports_src": set(),
+        "ports_dst": set(),
+        
+        "macs_all": set(),
+        "macs_src": set(),
+        "macs_dst": set(),
+        
+        "protos_all": set(),
+        "protos_src": set(),
+        "protos_dst": set(),
+        
+        # Used to anchor direction (IP + Port allows loopback testing)
+        "flow_src_ip": None,
+        "flow_src_port": None
     })
 
     reader = PcapReader(str(path))
 
     for pkt in reader:
         try:
+            # IP/IPv6 Parsing
             if IP in pkt:
                 ip = pkt[IP]
-                src = ip.src
-                dst = ip.dst
-                proto = ip.proto
+                src, dst, proto = ip.src, ip.dst, ip.proto
                 ttl = getattr(ip, "ttl", 0)
-                iplen = getattr(ip, "len", None)
-                if iplen is None:
-                    iplen = len(pkt)
-                try:
-                    flags = int(ip.flags)
-                except Exception:
-                    try:
-                        flags = int(str(ip.flags))
-                    except:
-                        flags = 0
-                frag_offset = getattr(ip, "frag", 0)
-                fragmented = (frag_offset != 0) or (flags & 0x1 != 0)
+                iplen = getattr(ip, "len", None) or len(pkt)
+                try: flags = int(ip.flags)
+                except: flags = 0
+                fragmented = (getattr(ip, "frag", 0) != 0) or (flags & 0x1 != 0)
             elif IPv6 in pkt:
                 ip = pkt[IPv6]
-                src = ip.src
-                dst = ip.dst
-                proto = ip.nh
+                src, dst, proto = ip.src, ip.dst, ip.nh
                 ttl = getattr(ip, "hlim", 0)
                 iplen = len(pkt)
                 flags = 0
@@ -166,55 +181,43 @@ def process_pcap(path):
             else:
                 continue
 
-            sport = dport = 0
-
+            # Transport Parsing
+            sport = dport = window = tcpflags = 0
             if TCP in pkt:
-                sport = pkt[TCP].sport
-                dport = pkt[TCP].dport
+                sport, dport = pkt[TCP].sport, pkt[TCP].dport
                 proto_name = "TCP"
                 window = getattr(pkt[TCP], "window", 0)
-                try:
-                    tcpflags = int(pkt[TCP].flags)
-                except Exception:
-                    try:
-                        tcpflags = int(str(pkt[TCP].flags))
-                    except:
-                        tcpflags = 0
-                opts = getattr(pkt[TCP], "options", None)
-                if opts:
-                    for o in opts:
-                        if isinstance(o, tuple) and len(o) >= 2 and o[0] == 'MSS':
-                            try:
-                                flows[tuple(sorted([(src, sport), (dst, dport)])) + (proto,) ]["mss"].append(int(o[1]))
-                            except:
-                                pass
+                try: tcpflags = int(pkt[TCP].flags)
+                except: tcpflags = 0
             elif UDP in pkt:
-                sport = pkt[UDP].sport
-                dport = pkt[UDP].dport
+                sport, dport = pkt[UDP].sport, pkt[UDP].dport
                 proto_name = "UDP"
-                window = 0
-                tcpflags = 0
             else:
                 proto_name = "OTHER"
-                window = 0
-                tcpflags = 0
 
-            key = tuple(sorted([(src,sport),(dst,dport)])) + (proto,)
-
+            key = tuple(sorted([(src, sport), (dst, dport)])) + (proto,)
             f = flows[key]
 
-            try:
-                t_val = float(pkt.time)
-            except Exception:
-                t_val = time.time()
+            # Anchor Direction (crucial for loopback/localhost testing)
+            if f["flow_src_ip"] is None:
+                f["flow_src_ip"] = src
+                f["flow_src_port"] = sport
+                
+            is_src = (src == f["flow_src_ip"] and sport == f["flow_src_port"])
 
+            # Time Processing (calculates deltas!)
+            try: t_val = float(pkt.time)
+            except: t_val = time.time()
+            
+            if f["times"]:
+                delta = t_val - f["times"][-1]
+                f["time_deltas"].append(max(0.0, delta))
             f["times"].append(t_val)
-            f["pkt_len"].append(int(len(pkt)))
-            try:
-                f["payload"].append(int(len(pkt.payload)))
-            except Exception:
-                f["payload"].append(0)
 
+            # Feature Appending
+            f["pkt_len"].append(int(len(pkt)))
+            try: f["payload"].append(int(len(pkt.payload)))
+            except: f["payload"].append(0)
             f["ttl"].append(int(ttl))
             f["ip_len"].append(int(iplen))
             f["flags"].append(int(flags))
@@ -223,126 +226,136 @@ def process_pcap(path):
 
             try:
                 hdr_len_est = int(len(pkt) - len(pkt.payload))
-                if hdr_len_est < 0:
-                    hdr_len_est = 0
-            except Exception:
-                hdr_len_est = 0
-            f["hdr_len"].append(hdr_len_est)
+                f["hdr_len"].append(max(0, hdr_len_est))
+            except:
+                f["hdr_len"].append(0)
 
             if fragmented:
                 f["fragmented_count"] += 1
 
-            f["ips"].update([src,dst])
-            f["ports"].update([sport,dport])
-            f["protocols"].add(proto_name)
+            # TCP Options parsing (MSS)
+            if TCP in pkt and getattr(pkt[TCP], "options", None):
+                for o in pkt[TCP].options:
+                    if isinstance(o, tuple) and len(o) >= 2 and o[0] == 'MSS':
+                        try: f["mss"].append(int(o[1]))
+                        except: pass
+
+            # Directional Sets & Counts
+            if is_src:
+                f["pkts_src"] += 1
+                f["ips_src"].add(src)
+                f["ports_src"].add(sport)
+                f["protos_src"].add(proto_name)
+            else:
+                f["pkts_dst"] += 1
+                f["ips_dst"].add(src) 
+                f["ports_dst"].add(sport)
+                f["protos_dst"].add(proto_name)
+
+            f["ips_all"].update([src, dst])
+            f["ports_all"].update([sport, dport])
+            f["protos_all"].add(proto_name)
 
             if Ether in pkt:
-                try:
-                    f["macs"].update([pkt[Ether].src,pkt[Ether].dst])
-                except Exception:
-                    pass
+                mac_src, mac_dst = pkt[Ether].src, pkt[Ether].dst
+                f["macs_all"].update([mac_src, mac_dst])
+                if is_src:
+                    f["macs_src"].add(mac_src)
+                    f["macs_dst"].add(mac_dst)
+                else:
+                    f["macs_dst"].add(mac_src)
+                    f["macs_src"].add(mac_dst)
 
         except Exception:
             continue
 
     reader.close()
 
-    rows=[]
-
-    for key,data in flows.items():
+    rows = []
+    for key, data in flows.items():
         if not data["times"]:
             continue
 
-        t0 = float(min(data["times"]))
-        t1 = float(max(data["times"]))
-
-        pkt_avg,pkt_max,pkt_min,pkt_std = safe_stats(data["pkt_len"])
-        pay_avg,pay_max,pay_min,pay_std = safe_stats(data["payload"])
-        ttl_avg,ttl_max,ttl_min,ttl_std = safe_stats(data["ttl"])
-        ip_avg,ip_max,ip_min,ip_std = safe_stats(data["ip_len"])
-        win_avg,win_max,win_min,win_std = safe_stats(data["window"])
-        hdr_avg,hdr_max,hdr_min,hdr_std = safe_stats(data["hdr_len"])
-        mss_avg,mss_max,mss_min,mss_std = safe_stats(data["mss"])
-        flags_avg,flags_max,flags_min,flags_std = safe_stats(data["flags"])
-        tcpflags_avg,tcpflags_max,tcpflags_min,tcpflags_std = safe_stats(data["tcp_flags"])
-
+        t0, t1 = float(min(data["times"])), float(max(data["times"]))
         totals = len(data["pkt_len"])
-        frag_count = data.get("fragmented_count", 0)
-        frag_score = float(frag_count) / totals if totals>0 else 0.0
+
+        pkt_avg, pkt_max, pkt_min, pkt_std = safe_stats(data["pkt_len"])
+        pay_avg, pay_max, pay_min, pay_std = safe_stats(data["payload"])
+        ttl_avg, ttl_max, ttl_min, ttl_std = safe_stats(data["ttl"])
+        ip_avg, ip_max, ip_min, ip_std = safe_stats(data["ip_len"])
+        win_avg, win_max, win_min, win_std = safe_stats(data["window"])
+        hdr_avg, hdr_max, hdr_min, hdr_std = safe_stats(data["hdr_len"])
+        mss_avg, mss_max, mss_min, mss_std = safe_stats(data["mss"])
+        flags_avg, flags_max, flags_min, flags_std = safe_stats(data["flags"])
+        tcpflags_avg, tcpflags_max, tcpflags_min, tcpflags_std = safe_stats(data["tcp_flags"])
+        td_avg, td_max, td_min, td_std = safe_stats(data["time_deltas"])
+
+        frag_count = data["fragmented_count"]
+        frag_score = float(frag_count) / totals if totals > 0 else 0.0
 
         tcp_flag_counts = count_tcp_flag_bits(data["tcp_flags"])
 
-        row = {c:"" for c in COLUMNS}
+        row = {c: "" for c in COLUMNS}
 
-        row["device_mac"]=";".join(sorted(data["macs"])) if data["macs"] else ""
-        row["network_packet-size_avg"]=pkt_avg
-        row["network_packet-size_max"]=pkt_max
-        row["network_packet-size_min"]=pkt_min
-        row["network_packet-size_std_deviation"]=pkt_std
+        # Original features
+        row["device_mac"] = ";".join(sorted(data["macs_all"])) if data["macs_all"] else ""
+        row["network_packet-size_avg"], row["network_packet-size_max"], row["network_packet-size_min"], row["network_packet-size_std_deviation"] = pkt_avg, pkt_max, pkt_min, pkt_std
+        row["network_payload-length_avg"], row["network_payload-length_max"], row["network_payload-length_min"], row["network_payload-length_std_deviation"] = pay_avg, pay_max, pay_min, pay_std
+        row["network_ttl_avg"], row["network_ttl_max"], row["network_ttl_min"], row["network_ttl_std_deviation"] = ttl_avg, ttl_max, ttl_min, ttl_std
+        row["network_ip-length_avg"], row["network_ip-length_max"], row["network_ip-length_min"], row["network_ip-length_std_deviation"] = ip_avg, ip_max, ip_min, ip_std
+        row["network_header-length_avg"], row["network_header-length_max"], row["network_header-length_min"], row["network_header-length_std_deviation"] = hdr_avg, hdr_max, hdr_min, hdr_std
+        row["network_window-size_avg"], row["network_window-size_max"], row["network_window-size_min"], row["network_window-size_std_deviation"] = win_avg, win_max, win_min, win_std
+        
+        row["network_mss_avg"], row["network_mss_max"], row["network_mss_min"], row["network_mss_std_deviation"] = mss_avg, mss_max, mss_min, mss_std
+        row["network_fragmentation-score"] = frag_score
+        row["network_fragmented-packets"] = frag_count
+        row["network_ip-flags_avg"], row["network_ip-flags_max"], row["network_ip-flags_min"], row["network_ip-flags_std_deviation"] = flags_avg, flags_max, flags_min, flags_std
+        
+        row["network_tcp-flags-ack_count"] = tcp_flag_counts["ack"]
+        row["network_tcp-flags-fin_count"] = tcp_flag_counts["fin"]
+        row["network_tcp-flags-psh_count"] = tcp_flag_counts["psh"]
+        row["network_tcp-flags-rst_count"] = tcp_flag_counts["rst"]
+        row["network_tcp-flags-syn_count"] = tcp_flag_counts["syn"]
+        row["network_tcp-flags-urg_count"] = tcp_flag_counts["urg"]
+        row["network_tcp-flags_avg"], row["network_tcp-flags_max"], row["network_tcp-flags_min"], row["network_tcp-flags_std_deviation"] = tcpflags_avg, tcpflags_max, tcpflags_min, tcpflags_std
 
-        row["network_payload-length_avg"]=pay_avg
-        row["network_payload-length_max"]=pay_max
-        row["network_payload-length_min"]=pay_min
-        row["network_payload-length_std_deviation"]=pay_std
+        row["timestamp"], row["timestamp_start"], row["timestamp_end"] = datetime.fromtimestamp(t0, timezone.utc).isoformat(), datetime.fromtimestamp(t0, timezone.utc).isoformat(), datetime.fromtimestamp(t1, timezone.utc).isoformat()
 
-        row["network_ttl_avg"]=ttl_avg
-        row["network_ttl_max"]=ttl_max
-        row["network_ttl_min"]=ttl_min
-        row["network_ttl_std_deviation"]=ttl_std
+        # === THE NEWLY FIXED MISSING FEATURES ===
+        row["network_packets_all_count"] = totals
+        row["network_packets_src_count"] = data["pkts_src"]
+        row["network_packets_dst_count"] = data["pkts_dst"]
 
-        row["network_ip-length_avg"]=ip_avg
-        row["network_ip-length_max"]=ip_max
-        row["network_ip-length_min"]=ip_min
-        row["network_ip-length_std_deviation"]=ip_std
+        row["network_time-delta_avg"], row["network_time-delta_max"], row["network_time-delta_min"], row["network_time-delta_std_deviation"] = td_avg, td_max, td_min, td_std
+        row["network_interval-packets"] = (t1 - t0) / totals if totals > 1 else 0.0
 
-        row["network_header-length_avg"]=hdr_avg
-        row["network_header-length_max"]=hdr_max
-        row["network_header-length_min"]=hdr_min
-        row["network_header-length_std_deviation"]=hdr_std
+        row["network_ips_all"] = ";".join(sorted(data["ips_all"]))
+        row["network_ips_all_count"] = len(data["ips_all"])
+        row["network_ips_src"] = ";".join(sorted(data["ips_src"]))
+        row["network_ips_src_count"] = len(data["ips_src"])
+        row["network_ips_dst"] = ";".join(sorted(data["ips_dst"]))
+        row["network_ips_dst_count"] = len(data["ips_dst"])
 
-        row["network_window-size_avg"]=win_avg
-        row["network_window-size_max"]=win_max
-        row["network_window-size_min"]=win_min
-        row["network_window-size_std_deviation"]=win_std
+        row["network_ports_all"] = ";".join(map(str, sorted(data["ports_all"])))
+        row["network_ports_all_count"] = len(data["ports_all"])
+        row["network_ports_src"] = ";".join(map(str, sorted(data["ports_src"])))
+        row["network_ports_src_count"] = len(data["ports_src"])
+        row["network_ports_dst"] = ";".join(map(str, sorted(data["ports_dst"])))
+        row["network_ports_dst_count"] = len(data["ports_dst"])
 
-        row["network_packets_all_count"]=totals
-        row["network_ips_all"]=";".join(sorted(data["ips"]))
-        row["network_ips_all_count"]=len(data["ips"])
-
-        row["network_ports_all"]=";".join(map(str,sorted(data["ports"])))
-        row["network_ports_all_count"]=len(data["ports"])
-
-        row["network_protocols_all"]=";".join(sorted(data["protocols"]))
-        row["network_protocols_all_count"]=len(data["protocols"])
-
-        row["network_mss_avg"]=mss_avg
-        row["network_mss_max"]=mss_max
-        row["network_mss_min"]=mss_min
-        row["network_mss_std_deviation"]=mss_std
-
-        row["network_fragmentation-score"]=frag_score
-        row["network_fragmented-packets"]=frag_count
-
-        row["network_ip-flags_avg"]=flags_avg
-        row["network_ip-flags_max"]=flags_max
-        row["network_ip-flags_min"]=flags_min
-        row["network_ip-flags_std_deviation"]=flags_std
-
-        row["network_tcp-flags-ack_count"]=tcp_flag_counts["ack"]
-        row["network_tcp-flags-fin_count"]=tcp_flag_counts["fin"]
-        row["network_tcp-flags-psh_count"]=tcp_flag_counts["psh"]
-        row["network_tcp-flags-rst_count"]=tcp_flag_counts["rst"]
-        row["network_tcp-flags-syn_count"]=tcp_flag_counts["syn"]
-        row["network_tcp-flags-urg_count"]=tcp_flag_counts["urg"]
-
-        row["network_tcp-flags_avg"]=tcpflags_avg
-        row["network_tcp-flags_max"]=tcpflags_max
-        row["network_tcp-flags_min"]=tcpflags_min
-        row["network_tcp-flags_std_deviation"]=tcpflags_std
-
-        row["timestamp"]=datetime.fromtimestamp(t0, timezone.utc).isoformat()
-        row["timestamp_start"]=datetime.fromtimestamp(t0, timezone.utc).isoformat()
-        row["timestamp_end"]=datetime.fromtimestamp(t1, timezone.utc).isoformat()
+        row["network_protocols_all"] = ";".join(sorted(data["protos_all"]))
+        row["network_protocols_all_count"] = len(data["protos_all"])
+        row["network_protocols_src"] = ";".join(sorted(data["protos_src"]))
+        row["network_protocols_src_count"] = len(data["protos_src"])
+        row["network_protocols_dst"] = ";".join(sorted(data["protos_dst"]))
+        row["network_protocols_dst_count"] = len(data["protos_dst"])
+        
+        row["network_macs_all"] = ";".join(sorted(data["macs_all"]))
+        row["network_macs_all_count"] = len(data["macs_all"])
+        row["network_macs_src"] = ";".join(sorted(data["macs_src"]))
+        row["network_macs_src_count"] = len(data["macs_src"])
+        row["network_macs_dst"] = ";".join(sorted(data["macs_dst"]))
+        row["network_macs_dst_count"] = len(data["macs_dst"])
 
         rows.append(row)
 
