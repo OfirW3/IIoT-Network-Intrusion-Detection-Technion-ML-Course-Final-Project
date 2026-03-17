@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INTERFACE="eth0"
+INTERFACE="lo"
 PCAP_DIR="../data/pcaps"
 DURATION=20
 
