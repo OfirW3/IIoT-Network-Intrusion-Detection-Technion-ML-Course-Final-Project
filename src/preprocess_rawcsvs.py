@@ -5,42 +5,27 @@ from datetime import datetime
 import time
 import json
 import pandas as pd
+import joblib
 
 # CONFIG
 RAW_DIR = Path("../data/raw_csvs")
 OUT_DIR = Path("../data/cleaned_csvs")
-POLL_INTERVAL = 20     # seconds between directory scans
-STABLE_WAIT = 2        # seconds to wait to confirm file size stability
+MODEL_DIR = Path("../models")
+TRAIN_COLS_PATH = MODEL_DIR / "training_columns.pkl"
 PROCESSED_DB = OUT_DIR / "processed_files.json"
+
+POLL_INTERVAL = 20
+STABLE_WAIT = 2
 
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# filtering lists (expanded to drop log metrics and leaking features)
-FATAL_KEYWORDS = [
-    # Label and classification leaks
-    "label", "attack", "class", "category", "status",
-    # OS Fingerprinting leaks (Drop completely, even averages/mins/maxs)
-    "ttl", "window", "mss",
-    # Extraneous host logging metrics (all zeros anyway)
-    "log"
-]
-
-TOXIC_KEYWORDS = [
-    # Temporal metadata that could be memorized by the model
-    "time", "date", "timestamp", "seq", "ack",
-    # Identifiers & Hardware (Drop raw strings, but keep _count/_length via SAFE_KEYWORDS)
-    "mac", "port", "addr", "id", "uuid", "token", "serial", "socket", "session",
-    "device", "host", "ip", "ips"
-]
-
-SAFE_KEYWORDS = ["duration", "interval", "rate", "delta", "mean", "std", "avg", "count", "length", "size"]
 def ensure_dirs_exist():
-    """Do not create directories — only verify they exist."""
-    if not RAW_DIR.exists():
-        raise RuntimeError(f"Missing required directory: {RAW_DIR} (create it before running).")
-    if not OUT_DIR.exists():
-        raise RuntimeError(f"Missing required directory: {OUT_DIR} (create it before running).")
+    for d in [RAW_DIR, OUT_DIR, MODEL_DIR]:
+        if not d.exists():
+            raise RuntimeError(f"Missing required directory: {d}")
+    if not TRAIN_COLS_PATH.exists():
+        raise RuntimeError(f"Missing {TRAIN_COLS_PATH}! Run the training script to generate it.")
 
 def load_processed():
     if PROCESSED_DB.exists():
@@ -54,12 +39,6 @@ def save_processed(s):
     PROCESSED_DB.write_text(json.dumps(sorted(list(s))))
 
 def stable_files(processed):
-    """
-    Efficient stability check:
-    - collect candidate files not yet processed
-    - record sizes, wait STABLE_WAIT seconds, recheck sizes
-    - return list of stable files (size unchanged and >0)
-    """
     candidates = []
     sizes_before = {}
     for p in RAW_DIR.glob("*.raw.csv"):
@@ -78,58 +57,13 @@ def stable_files(processed):
     stable = []
     for p, s1 in sizes_before.items():
         try:
-            s2 = p.stat().st_size
+            if s1 == p.stat().st_size and s1 > 0:
+                stable.append(p)
         except FileNotFoundError:
             continue
-        if s1 == s2 and s1 > 0:
-            stable.append(p)
     return sorted(stable)
 
-def select_features(cols):
-    """Return list of columns to keep based on anti-leak rules."""
-    keep = []
-    drop = []
-    for c in cols:
-        c_l = c.lower().strip()
-
-        # fatal keywords (leaking features and logs)
-        is_fatal = False
-        for f in FATAL_KEYWORDS:
-            if f == "log" and not c_l.startswith("log_"):
-                pass
-            elif f in c_l:
-                # specific safe exceptions if necessary (e.g. valid identifier flags)
-                if f == "id" and ("width" in c_l or "valid" in c_l):
-                    continue
-                is_fatal = True
-                break
-        
-        if c_l.startswith("log_") or is_fatal:
-            drop.append(c)
-            continue
-
-        # toxic keywords (time/sequence based leaks)
-        is_toxic = False
-        for t in TOXIC_KEYWORDS:
-            if t in c_l:
-                is_toxic = True
-                break
-        if is_toxic:
-            is_safe = False
-            for s in SAFE_KEYWORDS:
-                if s in c_l:
-                    is_safe = True
-                    break
-            if not is_safe:
-                drop.append(c)
-                continue
-
-        keep.append(c)
-    
-    return keep, drop
-
-def preprocess_file(path: Path):
-    """Read file, filter leaking features, coerce strictly to numeric (NaN->0), write cleaned CSV."""
+def preprocess_file(path: Path, expected_cols: list):
     print(f"[{now()}] Processing {path.name}")
     try:
         df = pd.read_csv(path, low_memory=False, on_bad_lines="skip")
@@ -137,40 +71,42 @@ def preprocess_file(path: Path):
         print(f"[{now()}] Failed to read {path.name}: {e}")
         return False
 
-    cols_to_keep, dropped = select_features(list(df.columns))
-    if not cols_to_keep:
-        print(f"[{now()}] No columns to keep for {path.name}; skipping.")
-        return False
+    # 1. Ensure all expected training columns exist (fill with 0 if missing from PCAP)
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = 0
 
-    df_keep = df[cols_to_keep].copy()
+    # 2. Strictly enforce ONLY the training features (no MACs, no timestamps)
+    df_keep = df[expected_cols].copy()
 
-    # Coerce everything remaining to numeric, NaN -> 0
-    df_clean = df_keep.apply(pd.to_numeric, errors="coerce").fillna(0)
+    # 3. Coerce everything to numeric, NaN -> 0
+    for col in expected_cols:
+        df_keep[col] = pd.to_numeric(df_keep[col], errors="coerce").fillna(0)
 
-    # output path: replace ".raw.csv" with ".cleaned.csv"
     out_name = path.name.rsplit(".raw.csv", 1)[0] + ".cleaned.csv"
     out_path = OUT_DIR / out_name
     try:
-        df_clean.to_csv(out_path, index=False)
-        print(f"[{now()}] Wrote cleaned CSV: {out_path.name}  (kept {len(cols_to_keep)} features, dropped {len(dropped)})")
+        df_keep.to_csv(out_path, index=False)
+        print(f"[{now()}] Wrote cleaned CSV: {out_path.name} (Strictly {len(expected_cols)} features)")
         return True
     except Exception as e:
         print(f"[{now()}] Failed to write cleaned CSV for {path.name}: {e}")
         return False
 
 def main():
-    ensure_dirs_exist()   # will raise if directories missing
+    ensure_dirs_exist()
     processed = load_processed()
+    expected_cols = joblib.load(TRAIN_COLS_PATH)
+    
     print(f"[{now()}] Watching {RAW_DIR} (poll every {POLL_INTERVAL}s).")
     try:
         while True:
             ready = stable_files(processed)
             if ready:
                 for p in ready:
-                    ok = preprocess_file(p)
+                    ok = preprocess_file(p, expected_cols)
                     if ok:
                         processed.add(p.name)
-                        # save processed DS; may raise if OUT_DIR removed — that's intended
                         save_processed(processed)
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
