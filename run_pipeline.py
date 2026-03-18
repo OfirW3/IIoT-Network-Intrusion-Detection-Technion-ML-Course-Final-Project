@@ -40,12 +40,12 @@ def main():
     # ==========================================
     # STEP 2: DEFINE CONTINUOUS BACKGROUND TASKS
     # ==========================================
-    # We define what to run, if it needs sudo, and what its working directory should be
+    # Using sys.executable dynamically passes the exact Python path down to the child scripts,
+    # ensuring they stay safely inside a virtual environment if the orchestrator was launched in one.
     background_tasks = [
         {"name": "Packet Sniffer",    "cmd": ["sudo", "bash", "sniff_rotate.sh"], "cwd": BASH_DIR, "is_sudo": True},
-        {"name": "PCAP Extractor",    "cmd": ["python3", "pcap_to_rawcsv.py"],    "cwd": SRC_DIR,  "is_sudo": False},
-        {"name": "Data Preprocessor", "cmd": ["python3", "preprocess_rawcsvs.py"],"cwd": SRC_DIR,  "is_sudo": False},
-        {"name": "Model Classifier",  "cmd": ["python3", "model_classification.py"], "cwd": SRC_DIR,  "is_sudo": False}
+        {"name": "PCAP Extractor",    "cmd": [sys.executable, "pcap_to_csv_daemon.py"],    "cwd": SRC_DIR,  "is_sudo": False},
+        {"name": "Model Classifier",  "cmd": [sys.executable, "model_classification.py"], "cwd": SRC_DIR,  "is_sudo": False}
     ]
     
     processes = []
