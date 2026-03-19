@@ -5,7 +5,8 @@ import time
 import sys
 from pathlib import Path
 from datetime import datetime
-
+import os
+            
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -16,7 +17,10 @@ def main():
     ROOT_DIR = Path(__file__).resolve().parent
     SRC_DIR = ROOT_DIR / "src"
     BASH_DIR = ROOT_DIR / "bash_scripts"
-    
+    # Do not buffer python's outputs
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
     # Verify the directories actually exist before trying to run things inside them
     if not SRC_DIR.exists() or not BASH_DIR.exists():
         print(f"[{now()}] Fatal Error: Could not find 'src' or 'bash_scripts' directories in {ROOT_DIR}")
@@ -55,7 +59,7 @@ def main():
             print(f"[{now()}] Launching {task['name']}...")
             
             # Launch the process in its designated directory
-            p = subprocess.Popen(task["cmd"], cwd=task["cwd"])
+            p = subprocess.Popen(task["cmd"], cwd=task["cwd"], env=env)
             processes.append((task["name"], p, task["is_sudo"]))
             
             # Stagger the launches by 2 seconds to let the pipeline breathe
