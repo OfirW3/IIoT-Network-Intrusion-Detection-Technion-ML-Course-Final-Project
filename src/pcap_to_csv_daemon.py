@@ -6,7 +6,8 @@ import re
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
-
+import os
+import subprocess
 import numpy as np
 import pandas as pd
 from scapy.all import rdpcap, IP, IPv6, TCP, UDP
@@ -291,7 +292,7 @@ def process_pcap(path, expected_columns):
     
     return df
 
-def main():
+def run_daemon():
     ensure_dirs()
     expected_columns = load_expected_columns()
     processed = load_processed()
@@ -321,4 +322,4 @@ def main():
         save_processed(processed)
 
 if __name__ == "__main__":
-    main()
+    run_daemon()

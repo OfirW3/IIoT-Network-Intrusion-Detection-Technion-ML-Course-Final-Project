@@ -11,9 +11,10 @@ import joblib
 # ==========================================
 # CONFIGURATION
 # ==========================================
-CLEANED_DIR = Path("../data/csvs")
-REPORTS_DIR = Path("../data/reports")
-MODEL_DIR = Path("../models")
+ROOT_DIR = Path(__file__).resolve().parent.parent
+CLEANED_DIR = ROOT_DIR / "data" / "csvs"
+REPORTS_DIR = ROOT_DIR / "data" / "reports"
+MODEL_DIR = ROOT_DIR / "models"
 
 POLL_INTERVAL = 20     
 PROCESSED_DB = REPORTS_DIR / "inference_processed.json"
@@ -62,7 +63,7 @@ def run_inference(file_path: Path, models: dict):
         print("Dataframe is empty. Skipping.", flush=True)
         return True
 
-    # This drops the IPs and Ports specifically for the model inference!
+    # This drops the IPs and Ports specifically for the model inference
     try:
         X_live = df[models['features']]
     except KeyError as e:
@@ -102,7 +103,7 @@ def run_inference(file_path: Path, models: dict):
     if len(attack_indices) == 0:
         report_lines.append("No attacks detected in this capture.")
     else:
-        # 1. CREATE AND SAVE A SEPARATE DATAFRAME ONLY FOR ATTACKS
+        # Create alert dataframe for alerting on attacks
         alerts_df = df.iloc[attack_indices].copy()
         alerts_df['predicted_attack_type'] = multi_preds_decoded[attack_indices]
         
@@ -115,7 +116,7 @@ def run_inference(file_path: Path, models: dict):
         alerts_df.to_csv(alerts_csv_path, index=False)
         report_lines.append(f"-> Full alert details saved to: {alerts_csv_path.name}\n")
 
-        # 2. PRINT TRUNCATED LIST TO GUI
+        # Print attacks list to gui
         MAX_DISPLAY = 50
         for idx in attack_indices[:MAX_DISPLAY]:
             attack_type = multi_preds_decoded[idx]
@@ -142,7 +143,7 @@ def run_inference(file_path: Path, models: dict):
     
     return True
 
-def main():
+def classify_traffic():
     ensure_dirs_exist()
     processed = load_processed()
     
@@ -178,4 +179,4 @@ def main():
         save_processed(processed)
 
 if __name__ == "__main__":
-    main()
+    classify_traffic()
