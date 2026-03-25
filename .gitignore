@@ -1,4 +1,4 @@
 .vscode/
 data/*
-*.txt
+.txt
 src/__pycache__/*
