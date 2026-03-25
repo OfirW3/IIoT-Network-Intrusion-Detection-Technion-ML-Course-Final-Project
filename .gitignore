@@ -1,4 +1,4 @@
 .vscode/
-data/*
-.txt
-src/__pycache__/*
+data/
+src/__pycache__/
+nids_env/
