@@ -100,7 +100,24 @@ def stable_ready_files(processed):
 def safe_std(values):
     return float(np.std(values)) if len(values) > 1 else 0.0
 
-def process_pcap(path, expected_columns):
+def get_active_flow_keys():
+    """Reads the current master CSV to establish which flows are already being tracked."""
+    if not MASTER_CSV.exists():
+        return set()
+    try:
+        df = pd.read_csv(MASTER_CSV, usecols=['src_ip', 'dst_ip', 'src_port', 'dst_port'])
+        keys = set()
+        for _, row in df.iterrows():
+            sip = str(row['src_ip'])
+            dip = str(row['dst_ip'])
+            sport = str(row['src_port']).replace('.0', '')
+            dport = str(row['dst_port']).replace('.0', '')
+            keys.add(tuple(sorted([f"{sip}:{sport}", f"{dip}:{dport}"])))
+        return keys
+    except Exception:
+        return set()
+
+def process_pcap(path, expected_columns, active_flow_keys):
     try:
         packets = rdpcap(str(path))
     except Exception as e:
@@ -126,10 +143,17 @@ def process_pcap(path, expected_columns):
         elif UDP in pkt:
             src_port, dst_port = pkt[UDP].sport, pkt[UDP].dport
             
-        flow_key = tuple(sorted([f"{src_ip}:{src_port}", f"{dst_ip}:{dst_port}"]) + [str(proto)])
+        base_key = tuple(sorted([f"{src_ip}:{src_port}", f"{dst_ip}:{dst_port}"]))
+        flow_key = base_key + (str(proto),)
         
         if flow_key not in flows:
+            # Enforce stateful tracking: ignore mid-stream TCP flows
+            if base_key not in active_flow_keys:
+                if TCP in pkt and 'S' not in pkt[TCP].flags:
+                    continue  # Drop packet. Belongs to a pre-existing unmonitored connection.
+                    
             flows[flow_key] = {"pkts": [], "anchor_src": src_ip}
+            
         flows[flow_key]["pkts"].append(pkt)
 
     flow_records = []
@@ -241,10 +265,8 @@ def process_pcap(path, expected_columns):
     return df[metadata_cols + META_COLS + expected_columns]
 
 def merge_stateful_dataframes(master_df, new_df, expected_columns):
-    """Mathematically merges two processed dataframes to update long-lived flows."""
     idx_cols = ['src_ip', 'dst_ip', 'src_port', 'dst_port']
     
-    # Ensure master_df has meta columns if it was created before this update
     for col in META_COLS:
         if col not in master_df.columns:
             master_df[col] = 0.0
@@ -258,17 +280,14 @@ def merge_stateful_dataframes(master_df, new_df, expected_columns):
 
     result_df = pd.DataFrame(index=master_df.index.union(new_df.index), columns=META_COLS + expected_columns)
 
-    # 1. Direct copy for flows only present in one timeframe
     for col in META_COLS + expected_columns:
         result_df.loc[only_old_idx, col] = master_df.loc[only_old_idx, col]
         result_df.loc[only_new_idx, col] = new_df.loc[only_new_idx, col]
 
-    # 2. Mathematical Merge for overlapping flows
     if not common_idx.empty:
         old_c = master_df.loc[common_idx]
         new_c = new_df.loc[common_idx]
 
-        # Handle Metadata Updates (Latest seen time, check if recently terminated)
         result_df.loc[common_idx, 'meta_last_seen'] = np.maximum(old_c['meta_last_seen'], new_c['meta_last_seen'])
         result_df.loc[common_idx, 'meta_terminated'] = np.maximum(old_c['meta_terminated'], new_c['meta_terminated'])
 
@@ -276,12 +295,10 @@ def merge_stateful_dataframes(master_df, new_df, expected_columns):
         n2 = new_c['network_packets_all_count'].astype(float)
         n_total = n1 + n2
 
-        # Time deltas have N-1 counts
         t_n1 = np.maximum(1, n1 - 1)
         t_n2 = np.maximum(1, n2 - 1)
         t_total = t_n1 + t_n2
 
-        # Aggregate Sums
         sum_cols = [
             'network_fragmented-packets', 'network_packets_all_count', 'network_packets_dst_count',
             'network_packets_src_count', 'network_tcp-flags-ack_count', 'network_tcp-flags-psh_count',
@@ -290,13 +307,11 @@ def merge_stateful_dataframes(master_df, new_df, expected_columns):
         for col in sum_cols:
             result_df.loc[common_idx, col] = old_c[col] + new_c[col]
 
-        # Aggregate Maxes & Mins
         for col in [c for c in expected_columns if c.endswith('_max')]:
             result_df.loc[common_idx, col] = np.maximum(old_c[col], new_c[col])
         for col in [c for c in expected_columns if c.endswith('_min')]:
             result_df.loc[common_idx, col] = np.minimum(old_c[col], new_c[col])
 
-        # Aggregate Averages and Std Deviations
         feature_bases = ['network_header-length', 'network_ip-length', 'network_packet-size', 'network_payload-length']
         for base in feature_bases:
             mu1, std1 = old_c[f'{base}_avg'], old_c[f'{base}_std_deviation']
@@ -308,7 +323,6 @@ def merge_stateful_dataframes(master_df, new_df, expected_columns):
             v_combined = ((std1**2 * n1) + (std2**2 * n2) + (n1 * n2 / n_total) * (mu1 - mu2)**2) / n_total
             result_df.loc[common_idx, f'{base}_std_deviation'] = np.sqrt(v_combined)
 
-        # Time-deltas require their own count denominator (t_n)
         base = 'network_time-delta'
         mu1, std1 = old_c[f'{base}_avg'], old_c[f'{base}_std_deviation']
         mu2, std2 = new_c[f'{base}_avg'], new_c[f'{base}_std_deviation']
@@ -336,24 +350,16 @@ def update_master_csv(new_df, expected_columns):
     # --- PRUNING PHASE ---
     initial_count = len(updated_df)
     if not updated_df.empty and 'meta_last_seen' in updated_df.columns:
-        # Determine current time context (latest packet time seen across all flows)
         global_latest_time = updated_df['meta_last_seen'].max()
-        
-        # 1. Remove flows that have cleanly terminated via FIN or RST
         updated_df = updated_df[updated_df['meta_terminated'] == 0.0]
-        
-        # 2. Remove flows that have been inactive for more than FLOW_TIMEOUT_SEC
         updated_df = updated_df[(global_latest_time - updated_df['meta_last_seen']) <= FLOW_TIMEOUT_SEC]
         
     pruned_count = initial_count - len(updated_df)
     if pruned_count > 0:
         print(f"[{now()}] Pruned {pruned_count} terminated or inactive flows from state.", flush=True)
     
-    # Final cleanup before saving
     updated_df.replace([np.inf, -np.inf], np.nan, inplace=True)
     updated_df.fillna(0.0, inplace=True)
-    
-    # Save the dataframe, making sure we don't accidentally drop empty index if 100% of flows were pruned
     updated_df.to_csv(MASTER_CSV, index=False)
 
 def run_daemon():
@@ -367,8 +373,12 @@ def run_daemon():
             files = stable_ready_files(processed)
 
             for p in files:
+                # 1. Fetch the actively tracked flows right before processing
+                active_keys = get_active_flow_keys()
+                
                 print(f"[{now()}] Processing {p.name}", flush=True)
-                df = process_pcap(p, expected_columns)
+                # 2. Pass them to the processor so it knows what to ignore
+                df = process_pcap(p, expected_columns, active_keys)
                 update_master_csv(df, expected_columns)
                 print(f"[{now()}] Updated state in {MASTER_CSV.name}", flush=True)
 
