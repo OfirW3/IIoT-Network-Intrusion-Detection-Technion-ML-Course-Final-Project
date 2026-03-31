@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime
 import time
 import json
+import os
 import pandas as pd
 import numpy as np
 import joblib
@@ -16,8 +17,10 @@ CLEANED_DIR = ROOT_DIR / "data" / "csvs"
 REPORTS_DIR = ROOT_DIR / "data" / "reports"
 MODEL_DIR = ROOT_DIR / "models"
 
+MASTER_CSV = CLEANED_DIR / "master_flows.csv"
+STATE_FILE = REPORTS_DIR / "inference_state.txt"
+
 POLL_INTERVAL = 20     
-PROCESSED_DB = REPORTS_DIR / "inference_processed.json"
 
 # Common column names
 SRC_IP_COLS = ['src_ip']
@@ -33,16 +36,17 @@ def ensure_dirs_exist():
         if not d.exists():
             d.mkdir(parents=True, exist_ok=True)
 
-def load_processed():
-    if PROCESSED_DB.exists():
+def load_last_mtime():
+    """Loads the last modified timestamp of the master CSV we processed."""
+    if STATE_FILE.exists():
         try:
-            return set(json.loads(PROCESSED_DB.read_text()))
+            return float(STATE_FILE.read_text().strip())
         except Exception:
             pass
-    return set()
+    return 0.0
 
-def save_processed(s):
-    PROCESSED_DB.write_text(json.dumps(sorted(list(s))))
+def save_last_mtime(mtime: float):
+    STATE_FILE.write_text(str(mtime))
 
 def get_col_val(row, possible_cols):
     for col in possible_cols:
@@ -50,8 +54,8 @@ def get_col_val(row, possible_cols):
             return str(row[col]).replace('.0', '')
     return "?"
 
-def run_inference(file_path: Path, models: dict):
-    print(f"\n[{now()}] Analyzing {file_path.name}...", flush=True)
+def run_inference(file_path: Path, models: dict, run_id: str):
+    print(f"\n[{now()}] Analyzing current state of {file_path.name}...", flush=True)
     
     try:
         df = pd.read_csv(file_path, low_memory=False)
@@ -80,9 +84,10 @@ def run_inference(file_path: Path, models: dict):
     report_lines = [
         "=" * 80,
         f"INFERENCE REPORT: {file_path.name}",
+        f"RUN ID: {run_id}",
         f"GENERATED AT: {now()}",
         "=" * 80,
-        f"Total Flows Analyzed: {total_flows}",
+        f"Total Active Flows Analyzed: {total_flows}",
         "-" * 80
     ]
 
@@ -92,52 +97,48 @@ def run_inference(file_path: Path, models: dict):
     else:
         report_lines.append("STATUS: NORMAL - No attacks detected.")
 
-    report_lines.append("\n--- ATTACK TYPE SUMMARY ---")
-    unique_attacks, counts = np.unique(multi_preds_decoded, return_counts=True)
-    for attack_type, count in zip(unique_attacks, counts):
-        report_lines.append(f"Type [{attack_type}]: {count} flows")
+    report_lines.append("\n--- TRAFFIC TYPE SUMMARY ---")
+    unique_types, counts = np.unique(multi_preds_decoded, return_counts=True)
+    for traffic_type, count in zip(unique_types, counts):
+        report_lines.append(f"Type [{traffic_type}]: {count} flows")
 
-    report_lines.append("\n--- DETAILED ATTACK LOG ---")
-    attack_indices = np.where(~is_benign)[0]
+    report_lines.append("\n--- DETAILED FLOW LOG ---")
     
-    if len(attack_indices) == 0:
-        report_lines.append("No attacks detected in this capture.")
-    else:
-        # Create alert dataframe for alerting on attacks
-        alerts_df = df.iloc[attack_indices].copy()
-        alerts_df['predicted_attack_type'] = multi_preds_decoded[attack_indices]
-        
-        # Move 'predicted_attack_type' to the very front of the CSV for readability
-        cols = alerts_df.columns.tolist()
-        cols.insert(0, cols.pop(cols.index('predicted_attack_type')))
-        alerts_df = alerts_df[cols]
-        
-        alerts_csv_path = REPORTS_DIR / f"alerts_{file_path.stem}.csv"
-        alerts_df.to_csv(alerts_csv_path, index=False)
-        report_lines.append(f"-> Full alert details saved to: {alerts_csv_path.name}\n")
+    # Create comprehensive dataframe for ALL flows (benign + attacks)
+    results_df = df.copy()
+    results_df['predicted_traffic_type'] = multi_preds_decoded
+    
+    # Move 'predicted_traffic_type' to the very front of the CSV for readability
+    cols = results_df.columns.tolist()
+    cols.insert(0, cols.pop(cols.index('predicted_traffic_type')))
+    results_df = results_df[cols]
+    
+    results_csv_path = REPORTS_DIR / f"full_log_{run_id}.csv"
+    results_df.to_csv(results_csv_path, index=False)
+    report_lines.append(f"-> Full classification details saved to: {results_csv_path.name}\n")
 
-        # Print attacks list to gui
-        MAX_DISPLAY = 50
-        for idx in attack_indices[:MAX_DISPLAY]:
-            attack_type = multi_preds_decoded[idx]
-            row = df.iloc[idx]
-            
-            src_ip = get_col_val(row, SRC_IP_COLS)
-            dst_ip = get_col_val(row, DST_IP_COLS)
-            src_port = get_col_val(row, SRC_PORT_COLS)
-            dst_port = get_col_val(row, DST_PORT_COLS)
-            
-            report_lines.append(f"Row {idx:06d} | TYPE: {attack_type:<10} | SRC: {src_ip}:{src_port:<5}  ->  DST: {dst_ip}:{dst_port}")
-            
-        if len(attack_indices) > MAX_DISPLAY:
-            report_lines.append(f"... and {len(attack_indices) - MAX_DISPLAY} more attacks. (See alert CSV)")
+    # Print a preview of the flows to the GUI/Console
+    MAX_DISPLAY = 50
+    for idx in range(min(total_flows, MAX_DISPLAY)):
+        traffic_type = multi_preds_decoded[idx]
+        row = df.iloc[idx]
+        
+        src_ip = get_col_val(row, SRC_IP_COLS)
+        dst_ip = get_col_val(row, DST_IP_COLS)
+        src_port = get_col_val(row, SRC_PORT_COLS)
+        dst_port = get_col_val(row, DST_PORT_COLS)
+        
+        report_lines.append(f"Row {idx:06d} | TYPE: {traffic_type:<10} | SRC: {src_ip}:{src_port:<5}  ->  DST: {dst_ip}:{dst_port}")
+        
+    if total_flows > MAX_DISPLAY:
+        report_lines.append(f"... and {total_flows - MAX_DISPLAY} more flows. (See full log CSV)")
 
     report_lines.append("=" * 80 + "\n")
 
     full_report_text = "\n".join(report_lines)
     print(full_report_text, flush=True)
 
-    report_name = f"report_{file_path.stem}.txt"
+    report_name = f"report_{run_id}.txt"
     report_path = REPORTS_DIR / report_name
     report_path.write_text(full_report_text)
     
@@ -145,7 +146,7 @@ def run_inference(file_path: Path, models: dict):
 
 def classify_traffic():
     ensure_dirs_exist()
-    processed = load_processed()
+    last_mtime = load_last_mtime()
     
     print(f"[{now()}] Loading Model into memory...", flush=True)
     try:
@@ -161,22 +162,30 @@ def classify_traffic():
         print(f"Failed to load models. Did you save them in the training script? Error: {e}", flush=True)
         return
 
-    print(f"[{now()}] Listening for cleaned CSVs in {CLEANED_DIR}...", flush=True)
+    print(f"[{now()}] Monitoring {MASTER_CSV.name} for state changes...", flush=True)
     
     try:
         while True:
-            for p in sorted(CLEANED_DIR.glob("*.cleaned.csv")):
-                if p.name not in processed:
+            if MASTER_CSV.exists():
+                current_mtime = MASTER_CSV.stat().st_mtime
+                
+                # If the file has been modified since we last checked
+                if current_mtime > last_mtime:
+                    # Brief pause to ensure the writer script has finished saving the CSV
                     time.sleep(1) 
-                    success = run_inference(p, models)
+                    
+                    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    success = run_inference(MASTER_CSV, models, run_id)
+                    
                     if success:
-                        processed.add(p.name)
-                        save_processed(processed)
+                        last_mtime = current_mtime
+                        save_last_mtime(last_mtime)
+                        
             time.sleep(POLL_INTERVAL)
             
     except KeyboardInterrupt:
         print(f"\n[{now()}] Shutting down Inference Engine.", flush=True)
-        save_processed(processed)
+        save_last_mtime(last_mtime)
 
 if __name__ == "__main__":
     classify_traffic()
